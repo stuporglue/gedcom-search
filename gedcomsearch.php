@@ -20,7 +20,7 @@
 
 
 spl_autoload_register(function ($class) {
-    $pathToPhpGedcom = __DIR__ . '/php-gedcom/library/'; 
+    $pathToPhpGedcom = __DIR__ . '/lib/php-gedcom/library/'; 
 
     if (!substr(ltrim($class, '\\'), 0, 7) == 'PhpGedcom\\') {
         return;
@@ -54,13 +54,13 @@ class GedcomSearch {
 
             // match weight should be permutations of : Exact, exact out of order, alpha only, soundex
 
-            'exact' => 10,
-            'exactAlpha' => 9,
-            'exactSoundex' => 8,
-            'outOfOrderExact' => 6,
+            'exactWords' => 10,
+            'outOfOrderWords' => 7,
+            'partialWords' => 3, // score is multiplied by percent match. Eg. if two of three search terms match, then this is multiplied by 2/3
+
+            'exactSoundex' => 6,
             'outOfOrderSoundex' => 5,
-            'partialExact' => 3,
-            'partialSoundex' => 3,
+            'partialSoundex' => 3, // score is multiplied by percent match. Eg. if two of three search terms match, then this is multiplied by 2/3
         );
 
         $this->typeWeight = Array(
@@ -71,7 +71,7 @@ class GedcomSearch {
         );
 
         $this->objectWeight= Array(
-            'indi' = Array(
+            'indi' => Array(
                 'name' => 10,
                 'note' => 8,
                 'event' => Array(
@@ -127,10 +127,18 @@ class GedcomSearch {
 
     // Run one search
     function search($searchString,$resultsLimit = 10){
+        $searchString = $this->simplifyText($searchString);
+
         $results = Array();
 
         foreach($this->gedcom->getIndi() as $indi){
-
+            if($names = $indi->getName()){
+                foreach($names as $name){
+                    $nametxt = $name->getName();
+                    $nameWeight = $this->calcMatchWeight($searchString,$nametxt);
+                    print "$nametxt: $nameWeight\n";
+                }
+            }    
         }
         foreach($this->gedcom->getFam() as $fam){
 
@@ -145,56 +153,34 @@ class GedcomSearch {
         return $results;
     }
 
-    // Determine the match weight for the given needle and haystack
-    function matchWeight($needle,$haystack){
+    // Make text only have lower case alpha-numeric characters with single spaces between words
+    function simplifyText($text){
+        // probably need to add an iconv to get rid of accents and stuff
+        $text = strtolower($text);
+        $text = preg_replace('/[^a-z0-9\s]/','',$text);
+        $text = preg_replace('/\s+/',' ',$text);
+        return $text;
+    }
 
-        $needle = strtolower($needle);
-        $haystack = strtolower($haystack);
+    // Determine the match weight for the given needle and haystack
+    function calcMatchWeight($needle,$haystack){
+
+        $haystack = $this->simplifyText($haystack);
 
         $highScore = 0;
 
         // exact match
-        if($this->matchWeight['exact'] > $highScore){
+        if($this->matchWeight['exactWords'] > $highScore){
             if(strpos($haystack,$needle) !== FALSE){
-                $highScore = $this->matchWeight['exact'];
+                $highScore = $this->matchWeight['exactWords'];
             }
         }
 
-        // Exact Alpha -- strip all non-alpha characters and search
-        if($this->matchWeight['exactAlpha'] > $highScore){
-            if(strpos(
-                preg_replace('/[^a-z]/','',$haystack),
-                preg_replace('/[^a-z]/','',$needle) !== FALSE){
-                    $highScore = $this->matchWeight['exactAlpha'];
-                }
-        }
-
-        // exact soundex
-        if($this->matchWeight['exactSoundex'] > $highScore){
-            $needlePieces = array_map('soundex',preg_split('/\s+',$needle));
-            $haystackPieces = array_map('soundex',preg_split('/\s+',$needle)); 
-            $firstNeedle = array_shift($needlePieces);
-            $soundexFoundex = array_search($firstNeedle,$haystackPieces);
-            while($soundexFoundex !== FALSE){
-                $foundMatch = TRUE;
-                $haystackPieces = array_slice($soundexFoundex + 1,$haystackPieces);
-                foreach($needlePieces as $i => $n){
-                    if($haystackPieces[$i] != $n){
-                        $foundMatch = FALSE;
-                        break;
-                    }
-                }
-                $soundexFoundex = array_search($firstNeedle,$haystackPieces);
-            }
-            if($foundMatch){
-                $highScore = $this->matchWeight['exactSoundex'];
-            }
-        }
 
         // Out of order Exact -- all pieces must match
         // partialExact -- some pieces must match (score multipled by ratio of matches)
-        if($this->matchWeight['outOfOrderExact'] > $highScore || $this->matchWeight['partialExact'] > $highScore){
-            $needles = preg_split('/\s+/',$needle);
+        if($this->matchWeight['outOfOrderWords'] > $highScore || $this->matchWeight['partialWords'] > $highScore){
+            $needles = explode(' ',$needle);
             if(count($needle) > 1){ // we did a 1 needle search first
                 $matches = 0;
                 foreach($needles as $needlePiece){
@@ -203,14 +189,63 @@ class GedcomSearch {
                     }
                 }
                 $ratio = $matches/count($needles);
-                if($ratio == 1 && $this->matchWeight['outOfOrderExact'] > $highScore){
-                    $highScore = $this->matchWeight['outOfOrderExact'];
+                if($ratio == 1 && $this->matchWeight['outOfOrderWords'] > $highScore){
+                    $highScore = $this->matchWeight['outOfOrderWords'];
                 }
-                if($ratio > 0 && $this->matchWeight['partialExact'] > $highScore){
-                    $highScore = $this->matchWeight['partialExact'];
+                if(($this->matchWeight['partialWords'] * $ratio) > $highScore){
+                    $highScore = $this->matchWeight['partialWords'] * $ratio;
                 }
             }
         }
+
+
+        // soundex searches
+        $needlePieces = array_map('metaphone',explode(' ',$needle));
+        $haystackPieces = array_map('metaphone',explode(' ',$haystack)); 
+
+        // find the index of the first search piece, then check if the subsequent haystake piece matches the 2nd, etc. 
+        // repeat until the first search piece is not found
+        if($this->matchWeight['exactSoundex'] > $highScore){
+            $firstNeedle = $needlePieces[0];
+            $partialHaystack = $haystackPieces;
+            $soundexFoundex = array_search($firstNeedle,$partialHaystack);
+            $foundMatch = FALSE;
+            while($soundexFoundex !== FALSE && count($partialHaystack) > 0){
+                $foundMatch = TRUE;
+                $partialHaystack = array_slice($partialHaystack,$soundexFoundex);
+                foreach($needlePieces as $i => $n){
+                    if($partialHaystack[$i] != $n){
+                        $foundMatch = FALSE;
+                        break;
+                    }
+                }
+                if($foundMatch){
+                    break;
+                }
+                $soundexFoundex = array_search($firstNeedle,$partialHaystack);
+            }
+            if($foundMatch){
+                $highScore = $this->matchWeight['exactSoundex'];
+            }
+        }
+
+        // out of order soundex, partial soundex
+        if($this->matchWeight['outOfOrderSoundex'] > $highScore || $this->matchWeight['partialSoundex'] > $highScore){
+            $matches = 0;
+            foreach($needlePieces as $needlePiece){
+                if(array_search($needlePiece,$haystackPieces) !== FALSE){
+                    $matches++;
+                } 
+            }
+            $ratio = $matches/count($needlePieces);
+            if($ratio == 1 && $this->matchWeight['outOfOrderSoundex'] > $highScore){
+                $highScore = $this->matchWeight['outOfOrderSoundex'];
+            }
+            if(($this->matchWeight['partialSoundex'] * $ratio) > $highScore){
+                $highScore = $this->matchWeight['partialSoundex'] * $ratio;
+            }
+        }
+
         return $highScore;
     }
 
